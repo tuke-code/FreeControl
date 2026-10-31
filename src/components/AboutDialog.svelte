@@ -20,6 +20,7 @@
     appUpdateBusy,
     compat,
     deviceCounts,
+    proxies,
     runAppUpdateCheck,
     updateOpenIntent,
   } from '../lib/store';
@@ -28,6 +29,7 @@
     cancelAppUpdate,
     openExternalLink,
     startAppUpdate,
+    switchAppUpdateChannel,
     EVENT_APP_UPDATE_PROGRESS,
   } from '../lib/api';
   import type { AppUpdateCheck, AppUpdateProgress, ChannelView } from '../lib/types';
@@ -207,6 +209,11 @@
   $: channelText = $t('about.update.channel', {
     channel: update.channel ? channelLabel(update.channel, $t) : $t('about.update.channelConnecting'),
   });
+  /** 候选通道数 = GitHub 直连 + 运行环境页配置的代理地址（与运行环境页同一算法）。 */
+  $: channelCount = $proxies.proxies.length + 1;
+  /** 只在下载资产阶段、且确实有别的通道可换时提供切换；校验阶段与只剩直连时不出现。 */
+  $: canSwitchChannel =
+    update.kind === 'downloading' && update.phase === 'download' && channelCount > 1;
   $: hasActions =
     update.kind === 'available' ||
     update.kind === 'downloading' ||
@@ -333,6 +340,20 @@
   function cancelDownload(): void {
     void cancelAppUpdate().catch(() => {});
     close();
+  }
+
+  /**
+   * 「切换通道」：只发命令，不改界面状态。
+   *
+   * 切换后的进度与通道由后端重发的进度事件驱动；命令失败通常表示下载已经结束，
+   * 此时把界面置为失败态反而会盖掉真实状态，故只保持现状。
+   */
+  async function switchChannel(): Promise<void> {
+    try {
+      await switchAppUpdateChannel();
+    } catch {
+      // 状态以后端事件为准，这里不把一次陈旧点击呈现成更新失败。
+    }
   }
 
   async function applyUpdate(): Promise<void> {
@@ -547,7 +568,19 @@
                   style:width={`${update.phase === 'verify' ? 100 : update.percent}%`}
                 />
               </div>
-              <div class="update-channel">{channelText}</div>
+              <div class="update-channel">
+                <span class="update-channel-text">{channelText}</span>
+                {#if canSwitchChannel}
+                  <button
+                    class="update-switch"
+                    type="button"
+                    on:click={switchChannel}
+                    use:tip={$t('about.update.switchChannelTip')}
+                  >
+                    {$t('about.update.switchChannel')}
+                  </button>
+                {/if}
+              </div>
             </div>
           {/if}
 

@@ -760,6 +760,9 @@ export const en: Record<MessageKey, string> = {
   "about.update.restartApply": "Restart and update",
   "about.update.apply": "Update now",
   "about.update.cancelDownload": "Cancel download",
+  "about.update.switchChannel": "Switch channel",
+  "about.update.switchChannelTip":
+    "Stop the current channel and download again from another one (current progress is discarded)",
   "about.update.recheck": "Check again",
   "about.update.retry": "Try again",
   "about.update.restartHint.one": "Restarting disconnects 1 device that is mirroring",

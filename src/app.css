@@ -3265,14 +3265,35 @@ input[type="range"]:focus-visible::-moz-range-thumb {
   transition: width 0.12s linear;
 }
 .update-channel {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
   margin-top: 7px;
-  text-align: left;
   font-size: 11.5px;
   color: var(--text-faint);
+}
+.update-channel-text {
   /* 通道标签可能带完整代理地址：固定一行，避免它换行把进度块撑高、而弹窗高度已定。 */
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+/* 「切换通道」与通道说明同级：纯文本、同一字号与颜色，不使用按钮容器或强调色。 */
+.update-switch {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.update-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
 }
 .update-actions {
   display: flex;

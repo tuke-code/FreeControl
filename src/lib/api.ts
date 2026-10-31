@@ -190,6 +190,9 @@ export const checkAppUpdate = (): Promise<AppUpdateCheck> => invoke('check_app_u
 export const startAppUpdate = (): Promise<AppUpdateOutcome> => invoke('start_app_update');
 /** 中断在途下载；已校验完成的待应用包保留。 */
 export const cancelAppUpdate = (): Promise<void> => invoke('cancel_app_update');
+/** 中断当前更新下载通道，改用下一条可用通道从零重下（下载阶段可用）。 */
+export const switchAppUpdateChannel = (): Promise<void> =>
+  invoke('switch_app_update_channel');
 /** 应用更新：Windows / AppImage 替换并重启；deb 交给系统安装器。 */
 export const applyAppUpdate = (): Promise<void> => invoke('apply_app_update');
 

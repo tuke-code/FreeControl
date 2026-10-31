@@ -695,6 +695,9 @@ export const zh = {
   'about.update.restartApply': '立即重启并更新',
   'about.update.apply': '立即更新',
   'about.update.cancelDownload': '取消下载',
+  'about.update.switchChannel': '切换通道',
+  'about.update.switchChannelTip':
+    '中断当前通道的下载，改用其他通道重新下载（当前进度会作废）',
   'about.update.recheck': '重新检查',
   'about.update.retry': '重试',
   'about.update.restartHint.one': '重启会断开 1 台正在投屏的设备',

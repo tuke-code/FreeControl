@@ -839,7 +839,10 @@
   .update-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12.5px; color: var(--text-dim); margin-bottom: 7px; }
   .update-progress-track { height: 6px; border-radius: 999px; background: var(--track); overflow: hidden; }
   .update-progress-bar { width: 0; height: 100%; border-radius: inherit; background: var(--accent); transition: width .12s linear; }
-  .update-channel { margin-top: 7px; text-align: left; font-size: 11.5px; color: var(--text-faint); }
+  .update-channel { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-top: 7px; font-size: 11.5px; color: var(--text-faint); }
+  .update-channel-text { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .update-switch { flex: none; padding: 0; border: 0; background: none; font: inherit; color: inherit; cursor: pointer; }
+  .update-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
   .update-actions { display: flex; justify-content: center; gap: 10px; margin-top: 18px; }
   .update-actions .btn { min-width: 128px; justify-content: center; }
   .update-hint { margin-top: 10px; font-size: 12px; color: var(--warn); }
@@ -2009,7 +2012,10 @@
           <div class="update-progress hidden" id="updateProgress">
             <div class="update-progress-head"><span id="updateProgressText">正在下载新版本…</span><span id="updateProgressPct">0%</span></div>
             <div class="update-progress-track"><div class="update-progress-bar" id="updateProgressBar"></div></div>
-            <div class="update-channel" id="updateChannel">下载通道：GitHub 直连</div>
+            <div class="update-channel">
+              <span class="update-channel-text" id="updateChannel">下载通道：GitHub 直连</span>
+              <button class="update-switch hidden" id="updateSwitch" type="button">切换通道</button>
+            </div>
           </div>
           <div class="update-actions hidden" id="updateActions">
             <button class="btn primary hidden" id="updatePrimary"><i data-lucide="cloud-download"></i><span>立即更新</span></button>
@@ -3867,6 +3873,7 @@
   let updateTimers = [];
   let updateProgressTimer = null;
   let updateState = 'checking';
+  let updateChan = 0;
 
   function clearUpdateTimers(){
     updateTimers.forEach(t => clearTimeout(t));
@@ -3954,12 +3961,23 @@
     }
   }
 
+  function updateChannelLabel(index){
+    return index === 0 ? 'GitHub 直连' : `代理 ${proxyList[index - 1]}`;
+  }
+  function refreshUpdateSwitch(){
+    const btn = document.getElementById('updateSwitch');
+    if (!btn) return;
+    const pct = parseInt(document.getElementById('updateProgressPct').textContent, 10) || 0;
+    const hasProxies = !!document.querySelector('#proxyList .proxy-item .tag.proxy');
+    btn.classList.toggle('hidden', !(updateState === 'downloading' && pct < 100 && hasProxies));
+  }
   function setUpdateProgress(pct){
     const value = Math.max(0, Math.min(100, Math.round(pct)));
     document.getElementById('updateProgressPct').textContent = value + '%';
     document.getElementById('updateProgressBar').style.width = value + '%';
     document.getElementById('updateProgressText').textContent = value >= 100 ? '正在校验文件…' : '正在下载新版本…';
-    document.getElementById('updateChannel').textContent = value >= 100 ? '校验通过后即可重启更新' : '下载通道：GitHub 直连';
+    document.getElementById('updateChannel').textContent = value >= 100 ? '校验通过后即可重启更新' : `下载通道：${updateChannelLabel(updateChan)}`;
+    refreshUpdateSwitch();
   }
 
   function setUpdateState(state){
@@ -3998,6 +4016,7 @@
     }
     document.getElementById('updateActions').classList.toggle('hidden', !cfg.primary && !cfg.retry && !cfg.cancel);
     if (cfg.progress) setUpdateProgress(0);
+    refreshUpdateSwitch();
     lucide.createIcons();
     const modal = document.querySelector('.about-modal');
     if (modal.classList.contains('update-mode')) modal.style.height = updateHeightForCurrentState() + 'px';
@@ -4020,8 +4039,9 @@
     updateTimers.push(setTimeout(() => { setUpdateState(result); markLastCheckSimulated(); }, 700));
   }
 
-  function startDownloadSimulation(){
+  function startDownloadSimulation(channel = 0){
     clearUpdateTimers();
+    updateChan = channel;
     setUpdateState('downloading');
     let pct = 0;
     setUpdateProgress(pct);
@@ -4038,6 +4058,7 @@
 
   function applyUpdatePreset(mode){
     clearUpdateTimers();
+    updateChan = 0;
     if (mode === 'downloading') {
       setUpdateState('downloading');
       setUpdateProgress(42);
@@ -4113,6 +4134,14 @@
     if (updateState === 'downloadfailed') startDownloadSimulation();
     else if (updateState === 'latest') startCheckSimulation('latest');
     else startCheckSimulation();
+  });
+  document.getElementById('updateSwitch').addEventListener('click', ()=>{
+    if (updateState !== 'downloading') return;
+    const total = proxyList.length + 1;
+    if (total <= 1) return;
+    // 与运行环境进度块同一套演示：中断当前通道，向后循环到下一跳并从零重下。
+    const next = updateChan + 1 >= total ? 1 : updateChan + 1;
+    startDownloadSimulation(next);
   });
   document.getElementById('updateCancel').addEventListener('click', closeAbout);
 
@@ -4955,6 +4984,7 @@
     }
     lucide.createIcons();
     box.querySelectorAll('[data-proxy-del]').forEach(b=>b.addEventListener('click', ()=>removeProxy(b.dataset.proxyDel)));
+    refreshUpdateSwitch();
   }
   function showProxyErr(msg){
     const el=document.getElementById('proxyErr');

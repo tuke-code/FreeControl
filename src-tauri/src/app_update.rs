@@ -484,6 +484,38 @@ fn unix_timestamp() -> u128 {
         .unwrap_or(0)
 }
 
+/// 把一次通道尝试的失败记入通道记忆与失败清单。
+///
+/// `Switched` 是用户主动跳过，只记「手动跳过」—— 既不进失败清单，也不写成
+/// 「无法建立连接」；`Canceled` 由调用方提前返回，这里不处理。
+fn record_attempt_error(
+    memory: &Mutex<ChannelMemory>,
+    failures: &mut Vec<String>,
+    channel: &Channel,
+    error: AttemptError,
+) {
+    match error {
+        AttemptError::Switched => memory.lock().unwrap().mark_skipped(channel),
+        AttemptError::Failure(failure) => {
+            if failure.unreachable {
+                memory.lock().unwrap().mark_unreachable(channel);
+            }
+            failures.push(format!("{}：{}", channel.label(), failure.reason));
+        }
+        AttemptError::Canceled => {}
+    }
+}
+
+/// 全部通道都没成功时的可读原因：一条失败都没有只可能是用户把通道都跳过了，
+/// 不能拼成一句空的失败列表。应用更新没有运行环境页的「手动放置」兜底。
+fn download_failure_reason(failures: &[String]) -> String {
+    if failures.is_empty() {
+        "更新包下载失败：可用下载通道都被跳过了，请重试".to_string()
+    } else {
+        format!("更新包下载失败（{}）", failures.join("；"))
+    }
+}
+
 async fn download_update(
     app: &AppHandle,
     state: &AppState,
@@ -533,6 +565,8 @@ async fn download_update(
         let url = channel.url_for(&plan.url);
         let label = channel.label();
         logger::info("app-update", format!("下载更新：尝试通道 {label}"));
+        // 每次尝试开始先发一次 0%：切换通道后进度立刻归零，界面也能马上标明新的通道。
+        emit_progress(app, "download", 0, channel);
         let mut last_percent: i32 = -1;
         let result = download::download_to_file(&client, &url, &tmp, &ctl, |done, total| {
             let percent = match total {
@@ -559,34 +593,44 @@ async fn download_update(
                     version: String::new(),
                 });
             }
-            // 更新视图没有「切换通道」入口；真收到也按一条通道失败处理。
             Err(AttemptError::Switched) => {
-                logger::warn("app-update", format!("通道「{label}」被跳过"));
-                failures.push(format!("{label}：已跳过"));
+                logger::info(
+                    "app-update",
+                    format!("用户切换通道：跳过「{label}」（不计为失败）"),
+                );
+                record_attempt_error(
+                    &state.channel_memory,
+                    &mut failures,
+                    channel,
+                    AttemptError::Switched,
+                );
             }
             Err(AttemptError::Failure(failure)) => {
                 logger::warn(
                     "app-update",
-                    format!("更新下载通道「{label}」失败：{}", failure.reason),
+                    format!(
+                        "更新下载通道「{label}」失败：{}{}",
+                        failure.reason,
+                        if failure.unreachable {
+                            "（本次运行内不再尝试该通道）"
+                        } else {
+                            ""
+                        }
+                    ),
                 );
-                if failure.unreachable {
-                    state
-                        .channel_memory
-                        .lock()
-                        .unwrap()
-                        .mark_unreachable(channel);
-                }
-                failures.push(format!("{label}：{}", failure.reason));
+                record_attempt_error(
+                    &state.channel_memory,
+                    &mut failures,
+                    channel,
+                    AttemptError::Failure(failure),
+                );
             }
         }
     }
 
     let Some(channel) = used_channel else {
         let _ = fs::remove_file(&tmp);
-        return Err(AppUpdateError::download(format!(
-            "更新包下载失败（{}）",
-            failures.join("；")
-        )));
+        return Err(AppUpdateError::download(download_failure_reason(&failures)));
     };
 
     emit_progress(app, "verify", 100, &channel);
@@ -627,6 +671,8 @@ async fn download_update(
         asset: plan.asset.clone(),
         kind: plan.kind,
     });
+    // 与运行环境安装成功后的口径一致：本次运行内累计的通道记忆（含手动跳过）一并清空。
+    state.channel_memory.lock().unwrap().clear();
     Ok(AppUpdateOutcome {
         status: "ready".to_string(),
         version: plan.version,
@@ -659,6 +705,20 @@ pub fn cancel_app_update(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// 中断当前更新下载通道、改用下一条可用通道从零重下（下载阶段可用）。
+///
+/// 没有在途下载时返回可读错误：这说明界面状态已经过期，静默成功会让用户以为切换生效了。
+#[tauri::command]
+pub fn switch_app_update_channel(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(ctl) = state.app_update_ctl.lock().unwrap().clone() {
+        logger::info("app-update", "用户请求切换应用更新下载通道");
+        ctl.request_skip();
+        Ok(())
+    } else {
+        Err("当前没有进行中的应用更新下载".to_string())
+    }
+}
+
 // ── 应用与重启 ─────────────────────────────────────────────
 
 fn replace_target(kind: PackageKind) -> Result<PathBuf, AppUpdateError> {
@@ -674,11 +734,105 @@ fn replace_target(kind: PackageKind) -> Result<PathBuf, AppUpdateError> {
     }
 }
 
+/// 当前文件名是否属于发行命名（规格 `release-build`「产物命名规则」的 Windows 形态）。
+///
+/// 接受现行的 `{前缀}_{版本}_windows_{架构}.exe`，也接受改名前的
+/// `{前缀}_{版本}_{架构}.exe` 与 `{前缀}_{版本}.exe`（后者只可能是 x64 时代）。
+/// 只有这种由产品自己命名的文件才在更新后跟随版本改名；`FreeControl.exe`、
+/// 用户重命名过的副本一律保持原路径。
+fn is_release_exe_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let Some(stem) = lower.strip_suffix(".exe") else {
+        return false;
+    };
+    let Some(rest) = ASSET_PREFIXES.iter().find_map(|prefix| {
+        stem.strip_prefix(&format!("{}_", prefix.to_ascii_lowercase()))
+    }) else {
+        return false;
+    };
+    let mut parts = rest.split('_');
+    let Some(version) = parts.next() else {
+        return false;
+    };
+    if !is_version_segment(version) {
+        return false;
+    }
+    match parts.collect::<Vec<_>>().as_slice() {
+        [] => true,
+        [arch] => is_windows_arch(arch),
+        ["windows", arch] => is_windows_arch(arch),
+        _ => false,
+    }
+}
+
+fn is_version_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn is_windows_arch(arch: &str) -> bool {
+    matches!(arch, "x64" | "arm64")
+}
+
+/// 本次更新应把新文件落到哪个路径；`None` 表示保持原路径（或该平台不做重命名）。
+fn renamed_target(target: &Path, asset: &str, kind: PackageKind) -> Option<PathBuf> {
+    if kind != PackageKind::WindowsExe {
+        return None;
+    }
+    let name = target.file_name()?.to_str()?;
+    if !is_release_exe_name(name) {
+        return None;
+    }
+    let asset_path = Path::new(asset);
+    let file_name = asset_path.file_name()?.to_str()?;
+    if file_name.is_empty() || asset_path.components().count() != 1 {
+        return None;
+    }
+    let desired = target.parent()?.join(file_name);
+    (desired != target).then_some(desired)
+}
+
+/// 旧文件先改隐藏备份，再把新文件落到启动路径；第二步失败时立即把旧文件恢复。
+fn swap_files(
+    target: &Path,
+    new_file: &Path,
+    start: &Path,
+    backup: &Path,
+) -> Result<(), AppUpdateError> {
+    fs::rename(target, backup)
+        .map_err(|e| AppUpdateError::write(format!("无法替换正在运行的程序：{e}")))?;
+    if let Err(e) = fs::rename(new_file, start) {
+        let _ = fs::rename(backup, target);
+        return Err(AppUpdateError::write(format!("无法写入新版本程序：{e}")));
+    }
+    Ok(())
+}
+
+/// 回滚一次已完成的文件落位：删掉新文件，把备份改回原路径。
+fn rollback_swap(target: &Path, start: &Path, backup: &Path) {
+    let _ = fs::remove_file(start);
+    let _ = fs::rename(backup, target);
+}
+
 fn replace_and_restart(app: &AppHandle, pending: &PendingAppUpdate) -> Result<(), AppUpdateError> {
     let target = replace_target(pending.kind)?;
     let dir = target
         .parent()
         .ok_or_else(|| AppUpdateError::write("无法定位程序所在目录"))?;
+    let desired = renamed_target(&target, &pending.asset, pending.kind);
+    let start = desired.clone().unwrap_or_else(|| target.clone());
+    if let Some(desired) = &desired {
+        logger::info(
+            "app-update",
+            format!(
+                "更新后将程序文件名改为 {}（原 {}）",
+                desired.display(),
+                target.display()
+            ),
+        );
+    }
     let backup = dir.join(format!(
         "{BACKUP_PREFIX}{}-{}-{}",
         pending.version,
@@ -686,18 +840,12 @@ fn replace_and_restart(app: &AppHandle, pending: &PendingAppUpdate) -> Result<()
         unix_timestamp()
     ));
 
-    fs::rename(&target, &backup)
-        .map_err(|e| AppUpdateError::write(format!("无法替换正在运行的程序：{e}")))?;
-    if let Err(e) = fs::rename(&pending.path, &target) {
-        let _ = fs::rename(&backup, &target);
-        return Err(AppUpdateError::write(format!("无法写入新版本程序：{e}")));
-    }
+    swap_files(&target, &pending.path, &start, &backup)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = fs::set_permissions(&target, fs::Permissions::from_mode(0o755)) {
-            let _ = fs::remove_file(&target);
-            let _ = fs::rename(&backup, &target);
+        if let Err(e) = fs::set_permissions(&start, fs::Permissions::from_mode(0o755)) {
+            rollback_swap(&target, &start, &backup);
             return Err(AppUpdateError::write(format!("无法赋予新版本执行权限：{e}")));
         }
     }
@@ -709,23 +857,22 @@ fn replace_and_restart(app: &AppHandle, pending: &PendingAppUpdate) -> Result<()
     }
     session::shutdown_all(app);
 
-    match std::process::Command::new(&target).spawn() {
+    match std::process::Command::new(&start).spawn() {
         Ok(_) => {
             logger::info(
                 "app-update",
                 format!(
                     "已替换为 v{} 并启动新进程（{}）",
                     pending.version,
-                    target.display()
+                    start.display()
                 ),
             );
             app.exit(0);
             Ok(())
         }
         Err(e) => {
-            // 新文件已落到原路径但拉不起来：把旧文件换回去，避免「更新了却打不开」。
-            let _ = fs::remove_file(&target);
-            let _ = fs::rename(&backup, &target);
+            // 新文件已落位但拉不起来：把旧文件换回去，避免「更新了却打不开」。
+            rollback_swap(&target, &start, &backup);
             Err(AppUpdateError::write(format!("新版本启动失败：{e}")))
         }
     }
@@ -1129,5 +1276,199 @@ mod tests {
         assert_eq!(parse_digest(Some(&hex)), Some(hex.to_ascii_lowercase()));
         assert_eq!(parse_digest(Some("sha256:xyz")), None);
         assert_eq!(parse_digest(None), None);
+    }
+
+    #[test]
+    fn switched_channel_is_marked_manual_and_not_failed() {
+        let memory = Mutex::new(ChannelMemory::default());
+        let mut failures = Vec::new();
+        let channel = Channel::Proxy {
+            url: "https://mirror.test".to_string(),
+        };
+        record_attempt_error(
+            &memory,
+            &mut failures,
+            &channel,
+            AttemptError::Switched,
+        );
+        assert!(failures.is_empty(), "手动跳过不得进入失败清单");
+        assert!(memory.lock().unwrap().manually_skipped(&channel));
+        assert!(!memory.lock().unwrap().skipped(&channel));
+        assert!(download_failure_reason(&failures).contains("跳过"));
+    }
+
+    #[test]
+    fn failed_channel_is_collected_with_reason() {
+        let memory = Mutex::new(ChannelMemory::default());
+        let mut failures = Vec::new();
+        let channel = Channel::Proxy {
+            url: "https://mirror.test".to_string(),
+        };
+        record_attempt_error(
+            &memory,
+            &mut failures,
+            &channel,
+            AttemptError::Failure(AttemptFailure {
+                reason: "请求超时".to_string(),
+                unreachable: true,
+            }),
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("请求超时"));
+        assert!(memory.lock().unwrap().skipped(&channel));
+    }
+
+    #[test]
+    fn download_failure_reason_distinguishes_all_skipped() {
+        assert!(download_failure_reason(&[]).contains("跳过"));
+        let failures = vec!["GitHub 直连：请求超时".to_string()];
+        let message = download_failure_reason(&failures);
+        assert!(message.contains("GitHub 直连：请求超时"));
+        assert!(!message.contains("跳过"));
+    }
+
+    #[test]
+    fn release_exe_name_recognizes_current_and_legacy_names() {
+        for name in [
+            "FreeControl_2.3.2_windows_x64.exe",
+            "FreeControl_2.3.2_windows_arm64.exe",
+            "FreeControl2_1.2.0_x64.exe",
+            "FreeControl2_1.0.1.exe",
+            "FREECONTROL_2.3.2_WINDOWS_X64.EXE",
+        ] {
+            assert!(is_release_exe_name(name), "应识别为发行命名：{name}");
+        }
+    }
+
+    #[test]
+    fn release_exe_name_rejects_stable_and_custom_names() {
+        for name in [
+            "FreeControl.exe",
+            "freecontrol.exe",
+            "mycopy.exe",
+            "FreeControl_2.3.2_windows_x64_backup.exe",
+            "FreeControl_dev_windows_x64.exe",
+            "FreeControl_2..3_windows_x64.exe",
+            "FreeControl_2.3.2_windows_x86.exe",
+            "FreeControl_2.3.2_windows_x64.zip",
+        ] {
+            assert!(!is_release_exe_name(name), "不应识别为发行命名：{name}");
+        }
+    }
+
+    #[test]
+    fn renamed_target_only_for_release_named_windows_exe() {
+        let target = Path::new("/apps/FreeControl_2.3.2_windows_x64.exe");
+        let desired = renamed_target(target, "FreeControl_2.3.3_windows_x64.exe", PackageKind::WindowsExe);
+        assert_eq!(
+            desired,
+            Some(PathBuf::from("/apps/FreeControl_2.3.3_windows_x64.exe"))
+        );
+
+        assert_eq!(
+            renamed_target(
+                Path::new("/apps/FreeControl.exe"),
+                "FreeControl_2.3.3_windows_x64.exe",
+                PackageKind::WindowsExe
+            ),
+            None
+        );
+        assert_eq!(
+            renamed_target(
+                Path::new("/apps/mycopy.exe"),
+                "FreeControl_2.3.3_windows_x64.exe",
+                PackageKind::WindowsExe
+            ),
+            None
+        );
+        assert_eq!(
+            renamed_target(
+                Path::new("/apps/FreeControl_2.3.2_linux_amd64.AppImage"),
+                "FreeControl_2.3.3_linux_amd64.AppImage",
+                PackageKind::AppImage
+            ),
+            None
+        );
+        assert_eq!(
+            renamed_target(
+                target,
+                "FreeControl_2.3.2_windows_x64.exe",
+                PackageKind::WindowsExe
+            ),
+            None,
+            "目标名与当前名相同不需要改名"
+        );
+        assert_eq!(
+            renamed_target(
+                target,
+                "../evil.exe",
+                PackageKind::WindowsExe
+            ),
+            None,
+            "资产名必须是纯文件名"
+        );
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fc2-app-update-{tag}-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn swap_files_places_new_file_at_the_versioned_name() {
+        let dir = temp_dir("rename");
+        let target = dir.join("FreeControl_2.3.2_windows_x64.exe");
+        let new_file = dir.join("download.tmp");
+        let start = dir.join("FreeControl_2.3.3_windows_x64.exe");
+        let backup = dir.join(format!("{BACKUP_PREFIX}backup"));
+        fs::write(&target, b"old").unwrap();
+        fs::write(&new_file, b"new").unwrap();
+
+        swap_files(&target, &new_file, &start, &backup).unwrap();
+        assert!(!target.exists(), "旧文件名不得留在目录里");
+        assert_eq!(fs::read_to_string(&start).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "old");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_files_rolls_back_when_destination_is_occupied() {
+        let dir = temp_dir("occupied");
+        let target = dir.join("FreeControl_2.3.2_windows_x64.exe");
+        let new_file = dir.join("download.tmp");
+        let start = dir.join("occupied");
+        let backup = dir.join(format!("{BACKUP_PREFIX}backup"));
+        fs::write(&target, b"old").unwrap();
+        fs::write(&new_file, b"new").unwrap();
+        // 用目录占住目标名：文件改名到同名目录必然失败，可稳定触发回滚。
+        fs::create_dir(&start).unwrap();
+
+        let err = swap_files(&target, &new_file, &start, &backup).unwrap_err();
+        assert_eq!(err.kind, "write");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        assert!(new_file.exists(), "失败后临时包应保留以便重试");
+        assert!(!backup.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_swap_restores_the_original_path() {
+        let dir = temp_dir("rollback");
+        let target = dir.join("FreeControl_2.3.2_windows_x64.exe");
+        let start = dir.join("FreeControl_2.3.3_windows_x64.exe");
+        let backup = dir.join(format!("{BACKUP_PREFIX}backup"));
+        fs::write(&start, b"new").unwrap();
+        fs::write(&backup, b"old").unwrap();
+
+        rollback_swap(&target, &start, &backup);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        assert!(!start.exists());
+        assert!(!backup.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

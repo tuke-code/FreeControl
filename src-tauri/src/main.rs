@@ -309,6 +309,7 @@ fn main() {
             app_update::check_app_update,
             app_update::start_app_update,
             app_update::cancel_app_update,
+            app_update::switch_app_update_channel,
             app_update::apply_app_update,
             links::open_external_link,
             logger::open_log_dir,
